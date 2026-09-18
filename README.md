@@ -316,6 +316,86 @@ De manera predeterminada, los archivos son almacenados en la carpeta como:
 Para cambiar los nombres de archivos, cree una implementacion de la interfaz `\PhpCfdi\CfdiSatScraper\Contracts\ResourceFileNamerInterface`
 y configura el descargador de recursos con el método `ResourceDownloader::setResourceFileNamer()`.
 
+## Descarga masiva de metadata (paquetes ZIP)
+
+Además de la consulta de metadata registro por registro (`listByPeriod`, `listByUuids`), el portal del SAT
+ofrece la opción *Descargar Metadata*, que genera de forma **asíncrona** un archivo ZIP con la metadata
+de todos los CFDI de un periodo. El objeto `MassiveMetadataScraper` implementa este flujo:
+
+1. Se ejecuta la consulta por filtros y se solicita al portal la generación del paquete.
+   El portal devuelve un folio (UUID) por cada solicitud.
+2. Hasta 48 horas después, el paquete está disponible para descarga.
+3. Se descarga el archivo ZIP del folio a una ruta local.
+
+Este flujo requiere un `MassiveDownloadGateway`, que extiende a `SatHttpGateway` con las operaciones
+de transporte necesarias. Como es la misma clase base, **se puede compartir la misma instancia**
+con `SatScraper` y así reutilizar la misma sesión.
+
+Los métodos para ejecutar la descarga masiva son:
+
+- Solicitar paquetes (días completos): `MassiveMetadataScraper::requestByPeriod(QueryByFilters $query): MetadataPackageList`
+- Solicitar paquetes (fechas exactas): `MassiveMetadataScraper::requestByDateTime(QueryByFilters $query): MetadataPackageList`
+- Listar paquetes disponibles: `MassiveMetadataScraper::listAvailablePackages(): AvailablePackageList`
+- Descargar un paquete: `MassiveMetadataScraper::downloadPackage(string $uuid, string $destinationPath): void`
+
+Al igual que `SatScraper::listByPeriod`, el método `requestByPeriod` normaliza el periodo a días
+completos: la fecha inicial se ajusta a las `00:00:00` y la fecha final a las `23:59:59`.
+Si necesitas un periodo con horas exactas utiliza `requestByDateTime`.
+
+Cuando la consulta es de CFDI *recibidos* y el periodo abarca más de un mes, se genera una solicitud
+(un folio) por cada mes, pues el portal no acepta rangos de varios meses en esa página.
+
+```php
+<?php declare(strict_types=1);
+
+use GuzzleHttp\Client;
+use PhpCfdi\CfdiSatScraper\QueryByFilters;
+use PhpCfdi\CfdiSatScraper\SatScraper;
+use PhpCfdi\CfdiSatScraper\MassiveDownload\MassiveDownloadGateway;
+use PhpCfdi\CfdiSatScraper\MassiveDownload\MassiveMetadataScraper;
+use PhpCfdi\CfdiSatScraper\Sessions\Fiel\FielSessionManager;
+use PhpCfdi\Credentials\Credential;
+
+/** @var Credential $credential */
+
+// se comparte el mismo gateway (misma sesión) entre ambos scrapers
+$gateway = new MassiveDownloadGateway(new Client(['verify' => false, 'curl' => [CURLOPT_SSL_CIPHER_LIST => 'DEFAULT@SECLEVEL=1']]));
+$sessionManager = FielSessionManager::create($credential);
+$satScraper = new SatScraper($sessionManager, $gateway);
+$massiveScraper = new MassiveMetadataScraper($sessionManager, $gateway);
+
+// primer paso: solicitar la generación del paquete, el resultado contiene los folios (UUID)
+// requestByPeriod normaliza a días completos: inicio 00:00:00, fin 23:59:59
+$query = new QueryByFilters(new DateTimeImmutable('2026-01-01'), new DateTimeImmutable('2026-09-30'));
+//$query->setDownloadType(DownloadType::recibidos());
+$packages = $massiveScraper->requestByPeriod($query);
+foreach ($packages as $package) {
+    echo 'Folio: ', $package->uuid(), PHP_EOL;
+}
+
+// segundo paso (hasta 48 horas después): listar los paquetes disponibles
+$available = $massiveScraper->listAvailablePackages();
+foreach ($available as $package) {
+    echo 'Disponible: ', $package->uuid(), PHP_EOL;
+}
+
+// tercer paso: descargar el ZIP de un folio disponible
+$IdSolicitud = 'c55506b0-39b8-4a9e-8aa9-d82474fe8702';
+if ($available->has($IdSolicitud)) {
+    $destino = __DIR__ . '/descargas/' . $IdSolicitud . '.zip';
+    $massiveScraper->downloadPackage($IdSolicitud, $destino);
+    echo 'ZIP descargado en: ', $destino, PHP_EOL;
+} else {
+    echo 'El folio no está disponible aún. Pendientes: ', PHP_EOL;
+    foreach ($available as $package) {
+        echo ' - ', $package->uuid(), PHP_EOL;
+    }
+}
+```
+
+Tome en cuenta que este flujo depende de páginas del portal del SAT que no son una API pública
+estable, por lo que podría dejar de funcionar si el SAT modifica dichas páginas.
+
 ## Procesar de forma personalizada cada descarga de CFDI
 
 Ejecutar el método `ResourceDownloader::download` devuelve un arreglo con los UUID que fueron efectivamente descargados.
